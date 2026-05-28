@@ -1,0 +1,231 @@
+name: Try to Create OCI A1 Flex VM
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oci-free-arm-instance
+  cancel-in-progress: false
+
+env:
+  OCI_CLI_REGION: us-phoenix-1
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  INSTANCE_NAME: openclaw-oracle-a1
+  VCN_NAME: openclaw-oci-vcn
+  SUBNET_NAME: openclaw-public-subnet
+  IG_NAME: openclaw-internet-gateway
+
+jobs:
+  create-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v2
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install --user --upgrade oci-cli
+
+      - name: Configure OCI CLI
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_CLI_USER
+          tenancy=$OCI_CLI_TENANCY
+          fingerprint=$OCI_CLI_FINGERPRINT
+          key_file=$HOME/.oci/oci_api_key.pem
+          region=$OCI_CLI_REGION
+          EOF
+          chmod 600 ~/.oci/config
+          oci os ns get >/dev/null
+
+      - name: Ensure Phoenix network
+        id: network
+        run: |
+          set -euo pipefail
+
+          get_id() {
+            local value="$1"
+            if [[ -z "$value" || "$value" == "null" || "$value" == "None" ]]; then
+              return 1
+            fi
+            printf '%s\n' "$value"
+          }
+
+          VCN_ID=$(oci network vcn list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$VCN_NAME" \
+            --all \
+            --query 'data[0].id' \
+            --raw-output 2>/dev/null || true)
+
+          if ! get_id "$VCN_ID" >/dev/null; then
+            VCN_ID=$(oci network vcn create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --display-name "$VCN_NAME" \
+              --cidr-block 10.0.0.0/16 \
+              --dns-label openclaw \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' \
+              --raw-output)
+          fi
+
+          RT_ID=$(oci network vcn get --vcn-id "$VCN_ID" --query 'data."default-route-table-id"' --raw-output)
+          SL_ID=$(oci network vcn get --vcn-id "$VCN_ID" --query 'data."default-security-list-id"' --raw-output)
+
+          IG_ID=$(oci network internet-gateway list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --vcn-id "$VCN_ID" \
+            --display-name "$IG_NAME" \
+            --all \
+            --query 'data[0].id' \
+            --raw-output 2>/dev/null || true)
+
+          if ! get_id "$IG_ID" >/dev/null; then
+            IG_ID=$(oci network internet-gateway create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --vcn-id "$VCN_ID" \
+              --display-name "$IG_NAME" \
+              --is-enabled true \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' \
+              --raw-output)
+          fi
+
+          oci network route-table update \
+            --rt-id "$RT_ID" \
+            --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"$IG_ID\"}]" \
+            --force >/dev/null
+
+          oci network security-list update \
+            --security-list-id "$SL_ID" \
+            --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all"}]' \
+            --ingress-security-rules '[{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}}]' \
+            --force >/dev/null
+
+          SUBNET_ID=$(oci network subnet list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --vcn-id "$VCN_ID" \
+            --display-name "$SUBNET_NAME" \
+            --all \
+            --query 'data[0].id' \
+            --raw-output 2>/dev/null || true)
+
+          if ! get_id "$SUBNET_ID" >/dev/null; then
+            SUBNET_ID=$(oci network subnet create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --vcn-id "$VCN_ID" \
+              --display-name "$SUBNET_NAME" \
+              --cidr-block 10.0.1.0/24 \
+              --dns-label public1 \
+              --route-table-id "$RT_ID" \
+              --security-list-ids "[\"$SL_ID\"]" \
+              --prohibit-public-ip-on-vnic false \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' \
+              --raw-output)
+          fi
+
+          echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Try to create 4C/24G A1 Flex VM
+        id: create_vm
+        continue-on-error: true
+        env:
+          SUBNET_ID: ${{ steps.network.outputs.subnet_id }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -u -o pipefail
+          : > attempt.log
+
+          EXISTING_ID=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$INSTANCE_NAME" \
+            --all \
+            --query "data[?'lifecycle-state'!='TERMINATED']|[0].id" \
+            --raw-output 2>/dev/null || true)
+
+          if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" && "$EXISTING_ID" != "None" ]]; then
+            echo "Instance already exists: $EXISTING_ID" | tee -a attempt.log
+            exit 0
+          fi
+
+          IMAGE_ID=$(oci compute image list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "24.04" \
+            --shape "VM.Standard.A1.Flex" \
+            --all \
+            --sort-by TIMECREATED \
+            --sort-order DESC \
+            --query 'data[0].id' \
+            --raw-output)
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh.pub"
+
+          for AD in "gABe:PHX-AD-1" "gABe:PHX-AD-2" "gABe:PHX-AD-3"; do
+            echo "===== Trying $AD =====" | tee -a attempt.log
+            OCI_OUTPUT=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --ssh-authorized-keys-file "$RUNNER_TEMP/ssh.pub" \
+              --assign-public-ip true \
+              --display-name "$INSTANCE_NAME" \
+              --boot-volume-size-in-gbs 200 \
+              --freeform-tags '{"managed-by":"github-actions","purpose":"openclaw"}' 2>&1 || true)
+
+            echo "$OCI_OUTPUT" | tee -a attempt.log
+            if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+              echo "SUCCESS in $AD" | tee -a attempt.log
+              exit 0
+            fi
+          done
+
+          echo "No capacity in any Phoenix AD this round." | tee -a attempt.log
+          exit 1
+
+      - name: Upload attempt log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-attempt-log
+          path: attempt.log
+          if-no-files-found: ignore
+
+      - name: Send Discord notification
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OUTCOME: ${{ steps.create_vm.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
+            echo "No Discord webhook configured; skipping notification."
+            exit 0
+          fi
+          LOG=$(tail -c 1700 attempt.log 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g')
+          curl -sS -H 'Content-Type: application/json' \
+            -d "{\"content\":\"OCI A1 Flex attempt: ${OUTCOME}\\n\\`\\`\\`\\n${LOG}\\n\\`\\`\\`\"}" \
+            "$DISCORD_WEBHOOK_URL" >/dev/null
