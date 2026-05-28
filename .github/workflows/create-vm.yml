@@ -160,7 +160,7 @@ jobs:
             --compartment-id "$COMPARTMENT_ID" \
             --display-name "$INSTANCE_NAME" \
             --all \
-            --query "data[?'lifecycle-state'!='TERMINATED']|[0].id" \
+            --query 'data[?"lifecycle-state"!=`TERMINATED`]|[0].id' \
             --raw-output 2>/dev/null || true)
 
           if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" && "$EXISTING_ID" != "None" ]]; then
@@ -229,3 +229,7 @@ jobs:
           curl -sS -H 'Content-Type: application/json' \
             -d "{\"content\":\"OCI A1 Flex attempt: ${OUTCOME}\\n\\`\\`\\`\\n${LOG}\\n\\`\\`\\`\"}" \
             "$DISCORD_WEBHOOK_URL" >/dev/null
+
+      - name: Fail workflow when no VM was created
+        if: steps.create_vm.outcome != 'success'
+        run: exit 1
